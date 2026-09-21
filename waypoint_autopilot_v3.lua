@@ -47,19 +47,12 @@ local currentIdx = 1
 local isRunning  = false
 local hbConn     = nil
 
--- Variables internas de movimiento
+-- Variables internas de movimiento (igual que en JumpAccel.lua)
 local airAccumulator = 0
 local lastTick       = tick()
 local wasAir         = false
 local activeBV       = nil
 local lastJumpTime   = tick()
-
--- NoClip / movimiento agresivo (sin gravedad ni colision)
-local noclipEnabled  = false
-local noclipBV       = nil
-local noclipBG       = nil
-local noclipConn     = nil
-local noclipBtn      = nil  -- forward-declare, se asigna con la GUI
 
 -- Forward-declare: statusLabel y startBtn se asignan después de crear la GUI
 local statusLabel = nil
@@ -115,19 +108,15 @@ local function addWaypoint()
     local idx = #waypoints
     markers[idx] = makeMarker(pos, idx)
     setStatus(idx .. " WP colocado(s).")
-    saveWaypoints()
 end
 
 local function removeLastWaypoint()
     local n = #waypoints
     if n == 0 then setStatus("No hay waypoints.") return end
-    -- Destruir el marcador visual y limpiar la entrada de la tabla en un solo paso
-    if markers[n] and markers[n].Parent then markers[n]:Destroy() end
-    markers[n] = nil
-    table.remove(waypoints, n)  -- remover por indice para mantener alineacion
-    table.remove(markers,   n)  -- idem
+    if markers[n] then markers[n]:Destroy(); markers[n] = nil end
+    table.remove(waypoints)
+    table.remove(markers)
     setStatus((#waypoints) .. " WP restante(s).")
-    saveWaypoints()
 end
 
 -- ── MOVIMIENTO (lógica JumpAccel adaptada) ────────────────────────────
@@ -172,126 +161,44 @@ local function onHeartbeat()
         return
     end
 
-    local dt   = tick() - lastTick
-    lastTick   = tick()
+    -- Dirección plana hacia el waypoint (Y=0, igual que JumpAccel con la cámara)
+    local dir = Vector3.new(diff.X, 0, diff.Z)
+    if dir.Magnitude > 0 then dir = dir.Unit end
 
-    if noclipEnabled then
-        -- Movimiento agresivo: sin gravedad, sin colision, va directo al WP en 3D
-        local dir3d = diff
-        if dir3d.Magnitude > 0 then dir3d = dir3d.Unit end
-        if activeBV then activeBV:Destroy() end
-        local bv = Instance.new("BodyVelocity")
-        bv.Velocity = dir3d * SPEED
-        bv.MaxForce = Vector3.new(4e5, 4e5, 4e5)
-        bv.P        = 1250
-        bv.Parent   = root
-        Debris:AddItem(bv, 0.1)
-        activeBV = bv
-    else
-        -- Movimiento normal: plano con auto-salto
-        local dir = Vector3.new(diff.X, 0, diff.Z)
-        if dir.Magnitude > 0 then dir = dir.Unit end
+    local dt     = tick() - lastTick
+    lastTick     = tick()
 
-        local isAir  = hum.FloorMaterial == Enum.Material.Air
-        local state  = hum:GetState()
-        local onGround = (
-            state == Enum.HumanoidStateType.Landed or
-            state == Enum.HumanoidStateType.Running
-        ) and not isAir
+    local isAir  = hum.FloorMaterial == Enum.Material.Air
+    local state  = hum:GetState()
+    local onGround = (
+        state == Enum.HumanoidStateType.Landed or
+        state == Enum.HumanoidStateType.Running
+    ) and not isAir
 
-        if wasAir and onGround then airAccumulator = 0 end
-        wasAir = isAir
+    -- Al aterrizar: reset acumulador (igual que JumpAccel)
+    if wasAir and onGround then
+        airAccumulator = 0
+    end
+    wasAir = isAir
 
-        if activeBV then activeBV:Destroy() end
-        local bv = Instance.new("BodyVelocity")
-        bv.Velocity = dir * SPEED
-        bv.MaxForce = Vector3.new(4e5, 0, 4e5)
-        bv.P        = 1250
-        bv.Parent   = root
-        Debris:AddItem(bv, 0.1)
-        activeBV = bv
+    -- BodyVelocity de 100ms — exactamente igual a JumpAccel,
+    -- solo cambia que dir apunta al waypoint en vez de a la cámara
+    if activeBV then activeBV:Destroy() end
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = dir * SPEED
+    bv.MaxForce = Vector3.new(4e5, 0, 4e5)  -- Y=0: no interfiere con gravedad
+    bv.P        = 1250
+    bv.Parent   = root
+    Debris:AddItem(bv, 0.1)
+    activeBV = bv
 
-        if onGround then
-            airAccumulator = airAccumulator + dt
-            if tick() - lastJumpTime >= JUMP_INTERVAL then
-                hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                lastJumpTime = tick()
-            end
+    -- Auto-salto cuando está en el suelo (igual que JumpAccel)
+    if onGround then
+        airAccumulator = airAccumulator + dt
+        if tick() - lastJumpTime >= JUMP_INTERVAL then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            lastJumpTime = tick()
         end
-    end
-end
-
-
--- ── NOCLIP / MOVIMIENTO AGRESIVO ──────────────────────────────────────
-local function setNoclipParts(char, nocollide)
-    if not char then return end
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") then
-            part.CanCollide = not nocollide
-        end
-    end
-end
-
-local function stopNoclip()
-    noclipEnabled = false
-    if noclipConn  then noclipConn:Disconnect();  noclipConn  = nil end
-    if noclipBV    then pcall(function() noclipBV:Destroy() end); noclipBV = nil end
-    if noclipBG    then pcall(function() noclipBG:Destroy() end); noclipBG = nil end
-    -- Restaurar colision y gravedad al personaje
-    local char = lp.Character
-    if char then
-        setNoclipParts(char, false)
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then hum.PlatformStand = false end
-    end
-    if noclipBtn then
-        noclipBtn.Text             = "NoClip  OFF"
-        noclipBtn.BackgroundColor3 = BG_PANEL
-        noclipBtn.TextColor3       = GRAY_TEXT
-    end
-end
-
-local function startNoclip()
-    noclipEnabled = true
-    if noclipBtn then
-        noclipBtn.Text             = "NoClip  ON"
-        noclipBtn.BackgroundColor3 = WHITE
-        noclipBtn.TextColor3       = Color3.fromRGB(15, 15, 15)
-    end
-
-    -- Loop que elimina colision frame a frame (necesario porque Roblox la restaura)
-    noclipConn = RunService.Stepped:Connect(function()
-        local char = lp.Character
-        if not char then return end
-        setNoclipParts(char, true)
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then hum.PlatformStand = true end
-
-        local root = char:FindFirstChild("HumanoidRootPart")
-        if not root then return end
-
-        -- BodyVelocity para vuelo: si el autopilot esta corriendo,
-        -- dirigir hacia el waypoint con Y libre; si no, mantener en sitio
-        if activeBV then return end  -- el autopilot ya maneja el BV
-        if noclipBV and noclipBV.Parent then
-            noclipBV.Velocity = Vector3.new(0, 0, 0)
-        else
-            if noclipBV then pcall(function() noclipBV:Destroy() end) end
-            local bv = Instance.new("BodyVelocity")
-            bv.Velocity = Vector3.new(0, 0, 0)
-            bv.MaxForce = Vector3.new(4e5, 4e5, 4e5)
-            bv.P        = 1250
-            bv.Parent   = root
-            noclipBV    = bv
-        end
-    end)
-end
-
-local function toggleNoclip()
-    if noclipEnabled then
-        stopNoclip()
-    else
-        startNoclip()
     end
 end
 
@@ -326,52 +233,6 @@ lp.CharacterAdded:Connect(function(char)
     setStatus("Respawn → retomando desde WP " .. currentIdx .. "/" .. #waypoints)
 end)
 
-
--- ── PERSISTENCIA (Gamepoint.json) ────────────────────────────────────
-local SAVE_FILE = "Gamepoint.json"
-
-local function encodeJSON(wp)
-    local parts = {}
-    for _, v in ipairs(wp) do
-        parts[#parts+1] = string.format(
-            "{"x":%.4f,"y":%.4f,"z":%.4f}", v.X, v.Y, v.Z)
-    end
-    return "[" .. table.concat(parts, ",") .. "]"
-end
-
-local function decodeJSON(str)
-    local result = {}
-    for x, y, z in str:gmatch('"x":(%-?[%d%.]+),"y":(%-?[%d%.]+),"z":(%-?[%d%.]+)') do
-        result[#result+1] = Vector3.new(tonumber(x), tonumber(y), tonumber(z))
-    end
-    return result
-end
-
-local function saveWaypoints()
-    pcall(function()
-        if writefile then
-            writefile(SAVE_FILE, encodeJSON(waypoints))
-        end
-    end)
-end
-
-local function loadWaypoints()
-    pcall(function()
-        if not readfile then return end
-        local ok, raw = pcall(readfile, SAVE_FILE)
-        if not ok or not raw or raw == "" then return end
-        local loaded = decodeJSON(raw)
-        for _, pos in ipairs(loaded) do
-            table.insert(waypoints, pos)
-            local idx = #waypoints
-            markers[idx] = makeMarker(pos, idx)
-        end
-        if #waypoints > 0 then
-            setStatus(#waypoints .. " WP cargados de Gamepoint.json")
-        end
-    end)
-end
-
 -- ══════════════════════════════════════════════════════════════════════
 --  GUI — pill B&W glassy (mismo estilo que el scanner de sonido)
 -- ══════════════════════════════════════════════════════════════════════
@@ -389,7 +250,7 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent         = pg
 
 local frame = Instance.new("Frame")
-frame.Size                   = UDim2.fromOffset(210, 164)
+frame.Size                   = UDim2.fromOffset(210, 138)
 frame.Position               = UDim2.new(0, 10, 0.20, 0)
 frame.BackgroundColor3       = BG_FRAME
 frame.BackgroundTransparency = 0.08
@@ -484,18 +345,13 @@ local btnRemove = makeBtn("✕  Último",   107, 26, 95, 22, false)
 -- Fila 2: [ ▶ Iniciar ] (ancho completo, primario)
 startBtn = makeBtn("▶  Iniciar", 8, 52, 194, 24, true)
 
--- Fila 3: [ NoClip ] toggle
-noclipBtn = makeBtn("NoClip  OFF", 8, 80, 194, 22, false)
-noclipBtn.MouseButton1Click:Connect(toggleNoclip)
-
--- Fila 4: slider de velocidad (10 - 600)
--- Slider de velocidad (10 - 600)
+-- Fila 3: slider de velocidad (10 – 600)
 local SLIDER_MIN = 10
 local SLIDER_MAX = 600
 
 local sliderRow = Instance.new("Frame")
 sliderRow.Size               = UDim2.fromOffset(194, 22)
-sliderRow.Position           = UDim2.fromOffset(8, 106)
+sliderRow.Position           = UDim2.fromOffset(8, 80)
 sliderRow.BackgroundTransparency = 1
 sliderRow.Parent             = frame
 
@@ -572,7 +428,7 @@ end)
 -- Status (2 líneas)
 statusLabel = Instance.new("TextLabel")
 statusLabel.Size               = UDim2.new(1, -16, 0, 24)
-statusLabel.Position           = UDim2.new(0, 8, 0, 134)
+statusLabel.Position           = UDim2.new(0, 8, 0, 108)
 statusLabel.BackgroundTransparency = 1
 statusLabel.Text               = "Sin waypoints."
 statusLabel.Font               = Enum.Font.Gotham
@@ -593,9 +449,6 @@ startBtn.MouseButton1Click:Connect(function()
         startMovement()
     end
 end)
-
--- Cargar waypoints guardados
-loadWaypoints()
 
 -- Drag
 local dragging, dragStart, pillOrigin = false, nil, nil
