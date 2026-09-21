@@ -19,6 +19,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
 local Debris           = game:GetService("Debris")
 local Workspace        = game:GetService("Workspace")
+local HttpService      = game:GetService("HttpService")
 
 local lp = Players.LocalPlayer
 local pg = lp:WaitForChild("PlayerGui")
@@ -53,6 +54,8 @@ local lastTick       = tick()
 local wasAir         = false
 local activeBV       = nil
 local lastJumpTime   = tick()
+local aggressiveMode = false
+local savedCollision = {}
 
 -- Forward-declare: statusLabel y startBtn se asignan después de crear la GUI
 local statusLabel = nil
@@ -96,6 +99,56 @@ local function makeMarker(pos, idx)
     return part
 end
 
+-- ── PERSISTENCIA ────────────────────────────────────────────────────────
+local SAVE_FILE = "Gamepoint"
+
+local function saveConfig()
+    if type(writefile) ~= "function" then return end
+
+    local data = {
+        waypoints = {},
+        speed = SPEED,
+        aggressiveMode = aggressiveMode,
+    }
+
+    for i, pos in ipairs(waypoints) do
+        data.waypoints[i] = {x = pos.X, y = pos.Y, z = pos.Z}
+    end
+
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+local function loadConfig()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
+    if not isfile(SAVE_FILE) then return end
+
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(SAVE_FILE))
+    end)
+    if not ok or type(data) ~= "table" then return end
+
+    if type(data.speed) == "number" then
+        SPEED = math.clamp(math.round(data.speed), 10, 600)
+    end
+
+    if type(data.aggressiveMode) == "boolean" then
+        aggressiveMode = data.aggressiveMode
+    end
+
+    if type(data.waypoints) == "table" then
+        for _, point in ipairs(data.waypoints) do
+            if type(point) == "table"
+            and type(point.x) == "number"
+            and type(point.y) == "number"
+            and type(point.z) == "number" then
+                table.insert(waypoints, Vector3.new(point.x, point.y, point.z))
+            end
+        end
+    end
+end
+
 -- ── WAYPOINT HELPERS ──────────────────────────────────────────────────
 local function addWaypoint()
     local char = lp.Character
@@ -107,17 +160,40 @@ local function addWaypoint()
     table.insert(waypoints, pos)
     local idx = #waypoints
     markers[idx] = makeMarker(pos, idx)
+    saveConfig()
     setStatus(idx .. " WP colocado(s).")
 end
 
 local function removeLastWaypoint()
     local n = #waypoints
     if n == 0 then setStatus("No hay waypoints.") return end
-    if markers[n] then markers[n]:Destroy(); markers[n] = nil end
-    table.remove(waypoints)
-    table.remove(markers)
+
+    local marker = table.remove(markers, n)
+    if marker then marker:Destroy() end
+
+    -- Fallback: si la tabla de marcadores quedó desincronizada,
+    -- también elimina el marcador físico del mismo índice.
+    local orphan = markerFolder:FindFirstChild("WP" .. n)
+    if orphan then orphan:Destroy() end
+
+    table.remove(waypoints, n)
+    saveConfig()
     setStatus((#waypoints) .. " WP restante(s).")
 end
+
+local function rebuildMarkers()
+    for _, child in ipairs(markerFolder:GetChildren()) do
+        child:Destroy()
+    end
+
+    markers = {}
+    for i, pos in ipairs(waypoints) do
+        markers[i] = makeMarker(pos, i)
+    end
+end
+
+loadConfig()
+rebuildMarkers()
 
 -- ── MOVIMIENTO (lógica JumpAccel adaptada) ────────────────────────────
 local function getChar()
@@ -127,10 +203,33 @@ local function getChar()
            c:FindFirstChildOfClass("Humanoid")
 end
 
+local function setAggressiveCollision(enabled, char)
+    char = char or lp.Character
+    if not char then return end
+
+    if enabled then
+        savedCollision = {}
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                savedCollision[obj] = obj.CanCollide
+                obj.CanCollide = false
+            end
+        end
+    else
+        for obj, original in pairs(savedCollision) do
+            if obj and obj.Parent then
+                obj.CanCollide = original
+            end
+        end
+        savedCollision = {}
+    end
+end
+
 local function stopMovement(reason)
     isRunning = false
     if hbConn then hbConn:Disconnect(); hbConn = nil end
     if activeBV then activeBV:Destroy(); activeBV = nil end
+    setAggressiveCollision(false)
     setStatus(reason or "Detenido.")
     if startBtn then startBtn.Text = "▶  Iniciar" end
 end
@@ -186,7 +285,9 @@ local function onHeartbeat()
     if activeBV then activeBV:Destroy() end
     local bv = Instance.new("BodyVelocity")
     bv.Velocity = dir * SPEED
-    bv.MaxForce = Vector3.new(4e5, 0, 4e5)  -- Y=0: no interfiere con gravedad
+    bv.MaxForce = aggressiveMode
+        and Vector3.new(4e5, 4e5, 4e5)
+        or Vector3.new(4e5, 0, 4e5)  -- modo normal: no interfiere con gravedad
     bv.P        = 1250
     bv.Parent   = root
     Debris:AddItem(bv, 0.1)
@@ -212,6 +313,7 @@ local function startMovement()
     lastTick       = tick()
     lastJumpTime   = tick()
     isRunning      = true
+    setAggressiveCollision(aggressiveMode)
 
     hbConn = RunService.Heartbeat:Connect(function() pcall(onHeartbeat) end)
     setStatus("Yendo a WP 1/" .. #waypoints)
@@ -230,6 +332,7 @@ lp.CharacterAdded:Connect(function(char)
     lastTick       = tick()
     lastJumpTime   = tick()
     activeBV       = nil  -- el BV murió con el personaje anterior
+    setAggressiveCollision(aggressiveMode, char)
     setStatus("Respawn → retomando desde WP " .. currentIdx .. "/" .. #waypoints)
 end)
 
@@ -250,7 +353,7 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent         = pg
 
 local frame = Instance.new("Frame")
-frame.Size                   = UDim2.fromOffset(210, 138)
+frame.Size                   = UDim2.fromOffset(210, 164)
 frame.Position               = UDim2.new(0, 10, 0.20, 0)
 frame.BackgroundColor3       = BG_FRAME
 frame.BackgroundTransparency = 0.08
@@ -345,13 +448,16 @@ local btnRemove = makeBtn("✕  Último",   107, 26, 95, 22, false)
 -- Fila 2: [ ▶ Iniciar ] (ancho completo, primario)
 startBtn = makeBtn("▶  Iniciar", 8, 52, 194, 24, true)
 
--- Fila 3: slider de velocidad (10 – 600)
+-- Fila 3: toggle de movimiento agresivo
+local aggressiveBtn = makeBtn("Movimiento agresivo: " .. (aggressiveMode and "ON" or "OFF"), 8, 80, 194, 20, false)
+
+-- Fila 4: slider de velocidad (10 – 600)
 local SLIDER_MIN = 10
 local SLIDER_MAX = 600
 
 local sliderRow = Instance.new("Frame")
 sliderRow.Size               = UDim2.fromOffset(194, 22)
-sliderRow.Position           = UDim2.fromOffset(8, 80)
+sliderRow.Position           = UDim2.fromOffset(8, 104)
 sliderRow.BackgroundTransparency = 1
 sliderRow.Parent             = frame
 
@@ -393,6 +499,7 @@ local function sliderSet(v)
     v = math.clamp(math.round(v), SLIDER_MIN, SLIDER_MAX)
     SPEED = v
     valLabel.Text = tostring(v)
+    saveConfig()
     local pct = (v - SLIDER_MIN) / (SLIDER_MAX - SLIDER_MIN)
     fill.Size      = UDim2.new(pct, 0, 1, 0)
     sKnob.Position = UDim2.new(pct, -6, 0.5, -6)
@@ -428,7 +535,7 @@ end)
 -- Status (2 líneas)
 statusLabel = Instance.new("TextLabel")
 statusLabel.Size               = UDim2.new(1, -16, 0, 24)
-statusLabel.Position           = UDim2.new(0, 8, 0, 108)
+statusLabel.Position           = UDim2.new(0, 8, 0, 132)
 statusLabel.BackgroundTransparency = 1
 statusLabel.Text               = "Sin waypoints."
 statusLabel.Font               = Enum.Font.Gotham
@@ -448,6 +555,15 @@ startBtn.MouseButton1Click:Connect(function()
     else
         startMovement()
     end
+end)
+
+aggressiveBtn.MouseButton1Click:Connect(function()
+    aggressiveMode = not aggressiveMode
+    aggressiveBtn.Text = "Movimiento agresivo: " .. (aggressiveMode and "ON" or "OFF")
+    if isRunning then
+        setAggressiveCollision(aggressiveMode)
+    end
+    saveConfig()
 end)
 
 -- Drag
