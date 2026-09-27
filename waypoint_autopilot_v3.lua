@@ -56,6 +56,10 @@ local activeBV       = nil
 local lastJumpTime   = tick()
 local aggressiveMode = false
 local savedCollision = {}
+local noclipEnabled = false
+local noclipConn = nil
+local noclipWallParts = {}
+local noclipLastHit = {}
 
 -- Forward-declare: statusLabel y startBtn se asignan después de crear la GUI
 local statusLabel = nil
@@ -109,6 +113,7 @@ local function saveConfig()
         waypoints = {},
         speed = SPEED,
         aggressiveMode = aggressiveMode,
+        noclipEnabled = noclipEnabled,
     }
 
     for i, pos in ipairs(waypoints) do
@@ -135,6 +140,10 @@ local function loadConfig()
 
     if type(data.aggressiveMode) == "boolean" then
         aggressiveMode = data.aggressiveMode
+    end
+
+    if type(data.noclipEnabled) == "boolean" then
+        noclipEnabled = data.noclipEnabled
     end
 
     if type(data.waypoints) == "table" then
@@ -223,6 +232,132 @@ local function setAggressiveCollision(enabled, char)
         end
         savedCollision = {}
     end
+end
+
+-- ── NOCLIP — solo atraviesa paredes, nunca el suelo ───────────────────
+-- A diferencia del noclip clásico de Infinite Yield, que desactiva
+-- CanCollide del personaje/vehículo completo, acá solo se desactiva
+-- temporalmente la colisión de obstáculos verticales detectados delante.
+-- Así el piso conserva su colisión y el personaje/vehículo no cae.
+local function getVehicleModel()
+    local char = lp.Character
+    if not char then return nil end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not seat then return nil end
+
+    local model = seat:FindFirstAncestorOfClass("Model")
+    return model
+end
+
+local function isVerticalWall(part, origin)
+    if not part or not part:IsA("BasePart") then return false end
+    if part:IsDescendantOf(lp.Character) then return false end
+
+    local vehicle = getVehicleModel()
+    if vehicle and part:IsDescendantOf(vehicle) then return false end
+
+    local direction = part.Position - origin
+    if direction.Magnitude <= 0 then return false end
+
+    return math.abs(direction.Unit.Y) < 0.65
+end
+
+local function rememberWallPart(part)
+    if not part or not part:IsA("BasePart") then return end
+    if noclipWallParts[part] == nil then
+        noclipWallParts[part] = part.CanCollide
+    end
+    part.CanCollide = false
+    noclipLastHit[part] = tick()
+end
+
+local function restoreNoclipWalls()
+    for part, original in pairs(noclipWallParts) do
+        if part and part.Parent then
+            part.CanCollide = original
+        end
+    end
+    noclipWallParts = {}
+    noclipLastHit = {}
+end
+
+local function scanNoclipWalls()
+    if not noclipEnabled then return end
+
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local vehicle = getVehicleModel()
+    local originPart = vehicle and (
+        vehicle.PrimaryPart
+        or vehicle:FindFirstChild("Chassis", true)
+        or vehicle:FindFirstChildWhichIsA("BasePart", true)
+    ) or root
+
+    if not originPart or not originPart:IsA("BasePart") then return end
+
+    local origin = originPart.Position + Vector3.new(0, 1.5, 0)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {char}
+    if vehicle then
+        table.insert(params.FilterDescendantsInstances, vehicle)
+    end
+    params.IgnoreWater = true
+
+    local directions = {
+        Vector3.new(1, 0, 0),
+        Vector3.new(-1, 0, 0),
+        Vector3.new(0, 0, 1),
+        Vector3.new(0, 0, -1),
+        Vector3.new(0.707, 0, 0.707),
+        Vector3.new(-0.707, 0, 0.707),
+        Vector3.new(0.707, 0, -0.707),
+        Vector3.new(-0.707, 0, -0.707),
+    }
+
+    for _, dir in ipairs(directions) do
+        local result = Workspace:Raycast(origin, dir * 5, params)
+        if result and isVerticalWall(result.Instance, origin) then
+            rememberWallPart(result.Instance)
+        end
+    end
+
+    local now = tick()
+    for part, lastHit in pairs(noclipLastHit) do
+        if now - lastHit > 0.35 then
+            local original = noclipWallParts[part]
+            if part and part.Parent and original ~= nil then
+                part.CanCollide = original
+            end
+            noclipLastHit[part] = nil
+            noclipWallParts[part] = nil
+        end
+    end
+end
+
+local function setNoclip(enabled)
+    noclipEnabled = enabled
+
+    if noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
+    end
+
+    if not enabled then
+        restoreNoclipWalls()
+        return
+    end
+
+    scanNoclipWalls()
+    noclipConn = RunService.Stepped:Connect(function()
+        if noclipEnabled then
+            scanNoclipWalls()
+        end
+    end)
 end
 
 local function stopMovement(reason)
@@ -353,7 +488,7 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent         = pg
 
 local frame = Instance.new("Frame")
-frame.Size                   = UDim2.fromOffset(210, 164)
+frame.Size                   = UDim2.fromOffset(220, 228)
 frame.Position               = UDim2.new(0, 10, 0.20, 0)
 frame.BackgroundColor3       = BG_FRAME
 frame.BackgroundTransparency = 0.08
@@ -361,6 +496,17 @@ frame.BorderSizePixel        = 0
 frame.Active                 = true
 frame.Parent                 = gui
 Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 14)
+
+local bgImage = Instance.new("ImageLabel")
+bgImage.Size = UDim2.fromScale(1, 1)
+bgImage.Position = UDim2.fromScale(0, 0)
+bgImage.BackgroundTransparency = 1
+bgImage.Image = "rbxassetid://122285096490875"
+bgImage.ImageTransparency = 0.78
+bgImage.ScaleType = Enum.ScaleType.Crop
+bgImage.ZIndex = 0
+bgImage.Parent = frame
+Instance.new("UICorner", bgImage).CornerRadius = UDim.new(0, 14)
 
 -- Overlay diagonal glassy
 local glassy = Instance.new("UIGradient")
@@ -419,6 +565,40 @@ titleLbl.TextColor3         = WHITE
 titleLbl.TextXAlignment     = Enum.TextXAlignment.Left
 titleLbl.Parent             = frame
 
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(18, 18)
+closeBtn.Position = UDim2.new(1, -24, 0, 4)
+closeBtn.BackgroundColor3 = BG_PANEL
+closeBtn.BackgroundTransparency = 0.05
+closeBtn.BorderSizePixel = 0
+closeBtn.Text = "×"
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+closeBtn.TextColor3 = GRAY_TEXT
+closeBtn.ZIndex = 5
+closeBtn.Parent = frame
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(1, 0)
+
+local reopenBtn = Instance.new("TextButton")
+reopenBtn.Size = UDim2.fromOffset(48, 48)
+reopenBtn.Position = UDim2.new(0, 10, 0.20, 0)
+reopenBtn.BackgroundColor3 = BG_FRAME
+reopenBtn.BackgroundTransparency = 0.05
+reopenBtn.BorderSizePixel = 0
+reopenBtn.Text = "WP"
+reopenBtn.Font = Enum.Font.GothamBlack
+reopenBtn.TextSize = 12
+reopenBtn.TextColor3 = WHITE
+reopenBtn.Visible = false
+reopenBtn.Active = true
+reopenBtn.ZIndex = 20
+reopenBtn.Parent = gui
+Instance.new("UICorner", reopenBtn).CornerRadius = UDim.new(1, 0)
+local reopenStroke = Instance.new("UIStroke")
+reopenStroke.Color = WHITE
+reopenStroke.Transparency = 0.45
+reopenStroke.Parent = reopenBtn
+
 -- Helper botón
 local function makeBtn(text, x, y, w, h, primary)
     local b = Instance.new("TextButton")
@@ -449,15 +629,17 @@ local btnRemove = makeBtn("✕  Último",   107, 26, 95, 22, false)
 startBtn = makeBtn("▶  Iniciar", 8, 52, 194, 24, true)
 
 -- Fila 3: toggle de movimiento agresivo
-local aggressiveBtn = makeBtn("Movimiento agresivo: " .. (aggressiveMode and "ON" or "OFF"), 8, 80, 194, 20, false)
+local aggressiveBtn = makeBtn("Movimiento agresivo: " .. (aggressiveMode and "ON" or "OFF"), 8, 80, 204, 20, false)
 
 -- Fila 4: slider de velocidad (10 – 600)
+local noclipBtn = makeBtn("Noclip de paredes + vehículos: " .. (noclipEnabled and "ON" or "OFF"), 8, 104, 204, 20, false)
+
 local SLIDER_MIN = 10
 local SLIDER_MAX = 600
 
 local sliderRow = Instance.new("Frame")
 sliderRow.Size               = UDim2.fromOffset(194, 22)
-sliderRow.Position           = UDim2.fromOffset(8, 104)
+sliderRow.Position           = UDim2.fromOffset(8, 128)
 sliderRow.BackgroundTransparency = 1
 sliderRow.Parent             = frame
 
@@ -534,8 +716,8 @@ end)
 
 -- Status (2 líneas)
 statusLabel = Instance.new("TextLabel")
-statusLabel.Size               = UDim2.new(1, -16, 0, 24)
-statusLabel.Position           = UDim2.new(0, 8, 0, 132)
+statusLabel.Size               = UDim2.new(1, -16, 0, 44)
+statusLabel.Position           = UDim2.new(0, 8, 0, 156)
 statusLabel.BackgroundTransparency = 1
 statusLabel.Text               = "Sin waypoints."
 statusLabel.Font               = Enum.Font.Gotham
@@ -565,6 +747,25 @@ aggressiveBtn.MouseButton1Click:Connect(function()
     end
     saveConfig()
 end)
+
+noclipBtn.MouseButton1Click:Connect(function()
+    setNoclip(not noclipEnabled)
+    noclipBtn.Text = "Noclip de paredes + vehículos: " .. (noclipEnabled and "ON" or "OFF")
+    setStatus(noclipEnabled and "Noclip: paredes activado. Suelo protegido." or "Noclip desactivado.")
+    saveConfig()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    frame.Visible = false
+    reopenBtn.Visible = true
+end)
+
+reopenBtn.MouseButton1Click:Connect(function()
+    frame.Visible = true
+    reopenBtn.Visible = false
+end)
+
+setNoclip(noclipEnabled)
 
 -- Drag
 local dragging, dragStart, pillOrigin = false, nil, nil
